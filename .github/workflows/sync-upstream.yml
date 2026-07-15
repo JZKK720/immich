@@ -1,0 +1,139 @@
+name: 'Sync Upstream'
+
+on:
+  schedule:
+    # Run weekly on Mondays at 06:00 UTC
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync-upstream:
+    name: Sync with upstream
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/immich-app/immich.git
+
+      - name: Fetch upstream
+        run: |
+          git fetch upstream --tags
+
+      - name: Determine latest upstream release tag
+        id: upstream-tag
+        run: |
+          # Find the latest non-prerelease tag on upstream
+          LATEST_TAG=$(git tag -l 'v*' --sort=-v:refname | grep -v -- '-rc' | head -1)
+          echo "tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
+          echo "Latest upstream release tag: $LATEST_TAG"
+
+      - name: Determine current fork version
+        id: fork-version
+        run: |
+          CURRENT_VERSION=$(node -p "require('./package.json').version")
+          CURRENT_TAG="v${CURRENT_VERSION}"
+          echo "tag=$CURRENT_TAG" >> "$GITHUB_OUTPUT"
+          echo "Current fork version: $CURRENT_VERSION (tag: $CURRENT_TAG)"
+
+      - name: Check if sync is needed
+        id: check
+        run: |
+          UPSTREAM_TAG="${{ steps.upstream-tag.outputs.tag }}"
+          FORK_TAG="${{ steps.fork-version.outputs.tag }}"
+
+          if [ "$UPSTREAM_TAG" = "$FORK_TAG" ]; then
+            echo "needs_sync=false" >> "$GITHUB_OUTPUT"
+            echo "Fork is already up to date at $FORK_TAG"
+          else
+            echo "needs_sync=true" >> "$GITHUB_OUTPUT"
+            echo "Sync needed: $FORK_TAG → $UPSTREAM_TAG"
+          fi
+
+      - name: Create sync branch and PR
+        if: steps.check.outputs.needs_sync == 'true'
+        env:
+          UPSTREAM_TAG: ${{ steps.upstream-tag.outputs.tag }}
+          FORK_TAG: ${{ steps.fork-version.outputs.tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BRANCH_NAME="sync/upstream-${UPSTREAM_TAG}"
+
+          # Delete local branch if it exists from a previous run
+          git branch -D "$BRANCH_NAME" 2>/dev/null || true
+
+          # Create a fresh branch from the upstream tag
+          git checkout -b "$BRANCH_NAME" "$UPSTREAM_TAG"
+
+          # Push the branch to origin (force to overwrite any stale branch)
+          git push origin "$BRANCH_NAME" --force
+
+          # Build PR body
+          RELEASE_NOTES_URL="https://github.com/immich-app/immich/releases/tag/${UPSTREAM_TAG}"
+          PR_BODY=$(cat <<EOF
+          ## Upstream Sync
+
+          This PR syncs the fork with the latest upstream release.
+
+          | | Version |
+          |---|---|
+          | **Current fork** | \`${FORK_TAG}\` |
+          | **Upstream target** | \`${UPSTREAM_TAG}\` |
+
+          ### Release notes
+          [${UPSTREAM_TAG} release notes](${RELEASE_NOTES_URL})
+
+          ### What's included
+          This sync brings in all changes from the upstream \`${UPSTREAM_TAG}\` release tag, including:
+          - Version bumps across all packages (server, web, mobile, ML, CLI, SDK)
+          - Bug fixes and feature changes since \`${FORK_TAG}\`
+          - Updated translations and documentation
+
+          ### Review checklist
+          - [ ] Review the diff for any conflicts with fork-specific changes
+          - [ ] Verify version numbers are correct in \`package.json\`, \`server/package.json\`, \`mobile/pubspec.yaml\`
+          - [ ] Confirm tests pass
+          - [ ] Merge this PR to complete the sync
+
+          ---
+          *This PR was automatically created by the [Sync Upstream workflow](https://github.com/${{ github.repository }}/actions/workflows/sync-upstream.yml).*
+          EOF
+          )
+
+          # Create pull request
+          gh pr create \
+            --title "chore: sync fork with upstream ${UPSTREAM_TAG}" \
+            --body "$PR_BODY" \
+            --base main \
+            --head "$BRANCH_NAME" \
+            --label "sync" || \
+          gh pr edit "$BRANCH_NAME" \
+            --title "chore: sync fork with upstream ${UPSTREAM_TAG}" \
+            --body "$PR_BODY"
+
+      - name: Summary
+        run: |
+          if [ "${{ steps.check.outputs.needs_sync }}" = "true" ]; then
+            echo "✅ Created sync PR for ${{ steps.upstream-tag.outputs.tag }}"
+          else
+            echo "✅ Fork is already up to date at ${{ steps.fork-version.outputs.tag }}"
+          fi
